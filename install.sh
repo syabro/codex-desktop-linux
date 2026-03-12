@@ -8,7 +8,8 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 INSTALL_DIR="${CODEX_INSTALL_DIR:-$SCRIPT_DIR/codex-app}"
-ELECTRON_VERSION="40.0.0"
+ELECTRON_VERSION=""
+ELECTRON_VERSION_DEFAULT="40.0.0"
 WORK_DIR="$(mktemp -d)"
 ARCH="$(uname -m)"
 
@@ -91,15 +92,33 @@ extract_dmg() {
     local dmg_path="$1"
     info "Extracting DMG with 7z..."
 
-    7z x -y "$dmg_path" -o"$WORK_DIR/dmg-extract" >&2 || \
-        error "Failed to extract DMG"
+    # 7z may return non-zero for harmless macOS symlink warnings (e.g. /Applications)
+    # Check for the .app bundle instead of relying on exit code
+    7z x -y "$dmg_path" -o"$WORK_DIR/dmg-extract" >&2 || true
 
     local app_dir
-    app_dir=$(find "$WORK_DIR/dmg-extract" -maxdepth 3 -name "*.app" -type d | head -1)
-    [ -n "$app_dir" ] || error "Could not find .app bundle in DMG"
+    app_dir=$(find "$WORK_DIR/dmg-extract" -maxdepth 4 -name "*.app" -type d | head -1)
+    [ -n "$app_dir" ] || error "Failed to extract DMG (no .app bundle found)"
 
     info "Found: $(basename "$app_dir")"
     echo "$app_dir"
+}
+
+# ---- Detect Electron version from extracted app ----
+detect_electron_version() {
+    local app_dir="$1"
+    local ver_file="$app_dir/Contents/Frameworks/Electron Framework.framework/Versions/A/Resources/version"
+    if [ -f "$ver_file" ]; then
+        local detected
+        detected="$(tr -d '[:space:]' < "$ver_file")"
+        if [[ "$detected" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            ELECTRON_VERSION="$detected"
+            info "Detected Electron version: $ELECTRON_VERSION"
+            return
+        fi
+    fi
+    ELECTRON_VERSION="$ELECTRON_VERSION_DEFAULT"
+    warn "Could not detect Electron version — using default: $ELECTRON_VERSION"
 }
 
 # ---- Build native modules in a clean directory ----
@@ -148,7 +167,7 @@ patch_asar() {
 
     info "Extracting app.asar..."
     cd "$WORK_DIR"
-    npx --yes asar extract "$resources_dir/app.asar" app-extracted
+    npx --yes @electron/asar extract "$resources_dir/app.asar" app-extracted
 
     # Copy unpacked native modules if they exist
     if [ -d "$resources_dir/app.asar.unpacked" ]; then
@@ -165,7 +184,7 @@ patch_asar() {
     # Repack
     info "Repacking app.asar..."
     cd "$WORK_DIR"
-    npx asar pack app-extracted app.asar --unpack "{*.node,*.so,*.dylib}" 2>/dev/null
+    npx @electron/asar pack app-extracted app.asar --unpack "{*.node,*.so,*.dylib}" 2>/dev/null
 
     info "app.asar patched"
 }
@@ -184,7 +203,20 @@ download_electron() {
 
     local url="https://github.com/electron/electron/releases/download/v${ELECTRON_VERSION}/electron-v${ELECTRON_VERSION}-linux-${electron_arch}.zip"
 
+    local shasums_url="https://github.com/electron/electron/releases/download/v${ELECTRON_VERSION}/SHASUMS256.txt"
+    local zip_name="electron-v${ELECTRON_VERSION}-linux-${electron_arch}.zip"
+
     curl -L --progress-bar -o "$WORK_DIR/electron.zip" "$url"
+    curl -sL -o "$WORK_DIR/SHASUMS256.txt" "$shasums_url"
+
+    local expected actual
+    expected=$(grep "$zip_name" "$WORK_DIR/SHASUMS256.txt" | awk '{print $1}' | head -1)
+    actual=$(sha256sum "$WORK_DIR/electron.zip" | awk '{print $1}')
+    if [ -n "$expected" ] && [ "$expected" != "$actual" ]; then
+        error "Electron checksum mismatch! Expected: $expected Got: $actual"
+    fi
+    info "Electron checksum verified"
+
     mkdir -p "$INSTALL_DIR"
     cd "$INSTALL_DIR"
     unzip -qo "$WORK_DIR/electron.zip"
@@ -220,17 +252,29 @@ install_app() {
 create_start_script() {
     cat > "$INSTALL_DIR/start.sh" << 'SCRIPT'
 #!/bin/bash
+set -euo pipefail
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WEBVIEW_DIR="$SCRIPT_DIR/content/webview"
 
-pkill -f "http.server 5175" 2>/dev/null
-sleep 0.3
+# Kill previous webview server if running
+pkill -f "http.server 5175" 2>/dev/null || true
+sleep 0.5
 
 if [ -d "$WEBVIEW_DIR" ] && [ "$(ls -A "$WEBVIEW_DIR" 2>/dev/null)" ]; then
     cd "$WEBVIEW_DIR"
-    python3 -m http.server 5175 &> /dev/null &
+    # Bind to localhost only (not 0.0.0.0)
+    nohup python3 -m http.server 5175 --bind 127.0.0.1 &> /dev/null &
     HTTP_PID=$!
     trap "kill $HTTP_PID 2>/dev/null" EXIT
+
+    # Wait for server to be ready (up to 5 seconds)
+    for i in $(seq 1 50); do
+        if python3 -c "import socket; s=socket.socket(); s.settimeout(0.1); s.connect(('127.0.0.1',5175)); s.close()" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+    done
 fi
 
 export CODEX_CLI_PATH="${CODEX_CLI_PATH:-$(which codex 2>/dev/null)}"
@@ -241,7 +285,12 @@ if [ -z "$CODEX_CLI_PATH" ]; then
 fi
 
 cd "$SCRIPT_DIR"
-exec "$SCRIPT_DIR/electron" --no-sandbox "$@"
+exec "$SCRIPT_DIR/electron" \
+    --no-sandbox \
+    --ozone-platform-hint=auto \
+    --disable-gpu-sandbox \
+    --enable-features=WaylandWindowDecorations \
+    "$@"
 SCRIPT
 
     chmod +x "$INSTALL_DIR/start.sh"
@@ -267,6 +316,8 @@ main() {
 
     local app_dir
     app_dir=$(extract_dmg "$dmg_path")
+
+    detect_electron_version "$app_dir"
 
     patch_asar "$app_dir"
     download_electron
